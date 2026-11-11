@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+dist/*
+!dist/izayoi.ahk
+# kana corpus (a directory locally, a symlink in cloud sessions)
+/corpus
