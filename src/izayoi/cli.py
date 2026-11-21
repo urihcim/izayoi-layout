@@ -234,6 +234,8 @@ def _cmd_optimize(args) -> None:
         cfg.restarts = args.restarts
     if args.seed is not None:
         cfg.seed = args.seed
+    from .ngram import Ngrams
+
     source = _load_source(args.corpus)
     us = _unit_stats(source, cfg.spec)
     init = load(args.init) if args.init else None
@@ -243,7 +245,6 @@ def _cmd_optimize(args) -> None:
     cost = load_cost_model(args.cost)
     trigrams = None
     if cost.trigram is not None:
-        from .ngram import Ngrams
         from .trigram import load_trigram, text_unit_trigrams, unit_trigrams
 
         if isinstance(source, Ngrams):
@@ -255,6 +256,8 @@ def _cmd_optimize(args) -> None:
     layout = annealer.to_layout(pos, args.output.stem)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     origin = f", init={args.init}" if args.init else ""
+    if isinstance(source, Ngrams):
+        origin += f", n-gram 表 {args.corpus.name}" + (" 3-gram 込み" if trigrams else "")
     header = f"# {args.config} から生成（seed={cfg.seed}{origin}, cost/kana={best:.4f}）\n"
     args.output.write_text(dump(layout, header), encoding="utf-8")
     print(f"wrote {args.output}")
