@@ -45,6 +45,7 @@ uv run izayoi eval candidates/foo.toml --romaji --detail   # 評価・比較
 
 - 自分の文章も評価に使いたいときは、`corpus/raw/<任意の名前>/*.txt`（UTF-8）に置いて `corpus-build` し直す。
 - モーラ単位の n-gram 表（ロゴス配列用）でも評価できる。`uv run izayoi corpus-fetch-ngram` のあと、`eval` / `optimize` に `--corpus corpus/ngram/logos` を付ける。
+- 3 打鍵の連なり（交互・ロール・方向転換・1 打飛ばしの同指など）は、n-gram 表で `eval --corpus corpus/ngram/logos --trigram` とすると表示する。3-gram 表（`3gram.csv`）を使う。`--detail` を付けると、悪い方向転換・同指・1 打飛ばし同指の多いキーの並びも表示する。指標の意味は [設計仕様](design.md) の 3.4 にある。
 - `config/optimize.toml`: キーに置く文字、後置シフトの規則、配置の制約（固定・置ける場所の制限・空けておくキー）、探索回数。
 - 気に入った案の一部だけを動かすには `optimize --init <配列> --free '<動かす文字>'`。それ以外の文字は固定する（制約に違反している文字だけは動かす）。
 - 手で編集した配列は `eval <配列> --config config/optimize.toml` で、制約を守っているかも確認できる。`--targets config/targets.toml` を付けると、打鍵数の目標を満たすかも表示する。
@@ -62,6 +63,7 @@ uv run izayoi eval candidates/foo.toml --romaji --detail   # 評価・比較
 | 段越え% | 同じ手で上段と下段を続けて打つ割合 |
 | 内ロール% / 外ロール% | 同じ手・同じ段で、隣の指へ内向き / 外向きに続けて打つ割合 |
 | 後置衝突% | 後置シフトの規則と衝突する並びの出現率 |
+| 3:交互% など | 3 打鍵の連なりの指標（`--trigram`。[設計仕様](design.md) の 3.4） |
 
 ## Claude Code のクラウドセッション
 

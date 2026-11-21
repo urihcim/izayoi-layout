@@ -104,6 +104,8 @@ def _cmd_eval(args) -> None:
         rows.append((path.stem, metrics(layout_stats(path.stem, layout, us, cost), cost)))
         details.append((path.stem, us))
     print(format_table(rows))
+    if args.trigram:
+        _print_trigrams(args, source, cost)
     if args.config:
         from .optimize import load_config
 
@@ -138,6 +140,43 @@ def _cmd_eval(args) -> None:
                 f"[{name}] 後置シフトの衝突（その並びを直接打てなくなる回数）: "
                 + " ".join(f"{r}:{c}" for r, c in conflicts if c)
             )
+
+
+def _print_trigrams(args, source, cost) -> None:
+    from .evaluate import Spec, format_table
+    from .ngram import Ngrams
+    from .trigram import (
+        class_masks,
+        has_trigram,
+        key_trigrams,
+        layout_keys_of,
+        load_trigram,
+        romaji_keys_of,
+        skip_masks,
+        trigram_metrics,
+        trigram_report,
+    )
+
+    if not isinstance(source, Ngrams) or not has_trigram(args.corpus):
+        raise ValueError("--trigram には 3gram.csv のある n-gram 表を --corpus に指定してください")
+    trigram = load_trigram(args.corpus)
+    rows, tris = [], []
+    if args.romaji:
+        tri = key_trigrams(source, trigram, romaji_keys_of)
+        rows.append(("ローマ字", trigram_metrics(tri)))
+    for path in args.layouts:
+        layout = load(path)
+        tri = key_trigrams(source, trigram, layout_keys_of(layout, Spec.from_layout(layout), cost))
+        rows.append((path.stem, trigram_metrics(tri)))
+        tris.append((path.stem, tri))
+    print("\n3 打鍵の連なり（3-gram 表）\n" + format_table(rows))
+    if args.detail:
+        masks = class_masks()
+        sfs, _ = skip_masks()
+        for name, tri in tris:
+            for c in ("悪い方向転換", "同指を含む"):
+                print(f"[{name}] " + trigram_report(tri, c, masks[c]))
+            print(f"[{name}] " + trigram_report(tri, "1打飛ばし同指", sfs))
 
 
 def _violations(layout, cfg) -> list[str]:
@@ -223,6 +262,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--detail", action="store_true", help="未対応文字と後置シフトの衝突を表示")
     p.add_argument("--config", type=Path, help="この設定の制約を守っているか確認する")
     p.add_argument("--targets", type=Path, help="打鍵数の目標（config/targets.toml）を確認する")
+    p.add_argument(
+        "--trigram",
+        action="store_true",
+        help="3 打鍵の連なりを評価する（--corpus に 3gram.csv のある n-gram 表が必要）",
+    )
     p.add_argument(
         "--corpus",
         type=Path,
