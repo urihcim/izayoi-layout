@@ -190,13 +190,16 @@ def romaji_stats(corpus: str) -> KeyStats:
 # --- metrics --------------------------------------------------------------
 
 
-def metrics(ks: KeyStats, cost: CostModel) -> dict[str, float]:
+def metrics(ks: KeyStats, cost: CostModel, trigram: np.ndarray | None = None) -> dict[str, float]:
+    """`trigram` (keystroke triples) adds the three-stroke cost of cost.trigram to コスト/かな."""
     strokes = ks.freq.sum()
     pairs = ks.bigram.sum()
     masks = classify_bigrams()
     rows = np.array([k.row for k in KEY_INFO])
     hands = np.array([k.hand for k in KEY_INFO])
     total_cost = ks.freq @ cost.effort + (ks.bigram * cost.bigram).sum()
+    if cost.trigram is not None and trigram is not None:
+        total_cost += (trigram * cost.trigram).sum()
     m = {
         "打鍵/かな": strokes / ks.n_kana,
         "コスト/かな": total_cost / ks.n_kana,

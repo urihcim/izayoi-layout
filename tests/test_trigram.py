@@ -14,6 +14,8 @@ from izayoi.trigram import (
     layout_keys_of,
     load_trigram,
     romaji_keys_of,
+    text_key_trigrams,
+    text_unit_trigrams,
     trigram_metrics,
 )
 
@@ -93,3 +95,37 @@ def test_trigram_metrics_sum_to_100():
     m = trigram_metrics(tri)
     classes = [v for name, v in m.items() if "1打飛ばし" not in name]
     assert sum(classes) == pytest.approx(100)
+
+
+def test_text_trigrams_match_ngram_tables():
+    layout = load(FIXTURES / "mini.toml")
+    spec = Spec.from_layout(layout)
+    cost = load_cost_model(COST)
+    lines = [["か", "き", "が", "ぱ", "か"], ["き", "き", "か"], ["ぱ"]]
+    ng, tri = tables(lines)
+    text = "\n".join("".join(m) for m in lines)
+    expected = key_trigrams(ng, tri, layout_keys_of(layout, spec, cost))
+    assert (text_key_trigrams(text, layout, spec, cost) == expected).all()
+
+
+def test_annealer_trigram_cost():
+    from izayoi.evaluate import segment
+    from izayoi.optimize import Annealer, load_config
+
+    root = Path(__file__).parent.parent
+    cfg = load_config(root / "config" / "optimize.toml")
+    cfg.iterations, cfg.restarts = 3000, 1
+    cost = load_cost_model(COST)
+    cost.trigram = np.random.default_rng(1).random(cost.trigram.shape)
+    corpus = "かがくのしんぽはめざましい。きょうはびょういんへいった、ぱんをかう\nてぃーをのむ\n"
+    us = segment(corpus, cfg.spec)
+    plain = Annealer(cfg, us, load_cost_model(COST))
+    annealer = Annealer(cfg, us, cost, trigrams=text_unit_trigrams(corpus, cfg.spec))
+    pos, best = annealer.run(log=lambda _: None)
+    # the updates from move to move add up to the cost computed from scratch
+    annealer.forget()
+    assert annealer.cost(pos) == pytest.approx(best)
+    layout = annealer.to_layout(pos, "t")
+    keys = text_key_trigrams(corpus, layout, Spec.from_layout(layout), cost)
+    extra = (keys * cost.trigram).sum() / us.n_kana
+    assert annealer.cost(pos) - plain.cost(pos) == pytest.approx(extra)

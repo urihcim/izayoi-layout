@@ -11,13 +11,13 @@ cannot type is not counted.
 from __future__ import annotations
 
 import csv
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
 
 from . import romaji
-from .evaluate import Spec, tokenizer, unit_keys
+from .evaluate import SEP, Spec, tokenizer, unit_keys
 from .keyboard import KEY_INDEX, KEY_INFO, N_KEYS, CostModel
 from .layout import Layout
 from .ngram import Ngrams
@@ -80,54 +80,144 @@ def romaji_keys_of(mora: str, nxt: str | None = None) -> tuple[int, ...] | None:
     return ids or None
 
 
-def key_trigrams(
-    ng: Ngrams, trigram: dict[tuple[str, str, str], int], keys_of: KeysOf
-) -> np.ndarray:
-    """(N_KEYS, N_KEYS, N_KEYS) counts of consecutive keystroke triples."""
-    out = np.zeros((N_KEYS, N_KEYS, N_KEYS))
+def count_runs(
+    ng: Ngrams, trigram: dict[tuple[str, str, str], int], seq_of: KeysOf
+) -> dict[tuple[int, int, int], float]:
+    """Counts of runs of three consecutive items (keystrokes or units).
 
-    def add(runs: Iterable[tuple[int, int, int]], c: int) -> None:
-        for a, b, d in runs:
-            out[a, b, d] += c
+    `seq_of` gives the items of a mora (None if it cannot be typed)."""
+    out: dict[tuple[int, int, int], float] = {}
 
-    def inside(ks: tuple[int, ...] | None, c: int) -> None:
+    def add(run: tuple[int, int, int], c: float) -> None:
+        out[run] = out.get(run, 0) + c
+
+    def inside(ks: tuple[int, ...] | None, c: float) -> None:
         if ks and len(ks) >= 3:
-            add(zip(ks, ks[1:], ks[2:], strict=False), c)
+            for run in zip(ks, ks[1:], ks[2:], strict=False):
+                add(run, c)
 
     # Runs inside a mora: spelled for the next mora when there is one (romaji っ ん).
     followed: dict[str, int] = {}
     for (m1, m2), c in ng.bigram.items():
-        inside(keys_of(m1, m2), c)
+        inside(seq_of(m1, m2), c)
         followed[m1] = followed.get(m1, 0) + c
     for m, c in ng.unigram.items():
-        inside(keys_of(m, None), max(c - followed.get(m, 0), 0))
+        inside(seq_of(m, None), max(c - followed.get(m, 0), 0))
     # Runs from m1 into m2. The strokes of m2 depend on the mora after it (romaji
     # っ ん), taken from the 3-gram table; the rest is spelled without it.
     after: dict[tuple[str, str], list[tuple[str, int]]] = {}
     for (m1, m2, m3), c in trigram.items():
         after.setdefault((m1, m2), []).append((m3, c))
     for (m1, m2), c in ng.bigram.items():
-        k1 = keys_of(m1, m2)
+        k1 = seq_of(m1, m2)
         if not k1:
             continue
         nexts = after.get((m1, m2), [])
         rest = max(c - sum(n for _, n in nexts), 0)
         for m3, n in [*nexts, (None, rest)]:
-            k2 = keys_of(m2, m3)
+            k2 = seq_of(m2, m3)
             if not k2 or not n:
                 continue
-            # first stroke in m1, last stroke in m2
+            # first item in m1, last item in m2
             if len(k1) >= 2:
-                add([(k1[-2], k1[-1], k2[0])], n)
+                add((k1[-2], k1[-1], k2[0]), n)
             if len(k2) >= 2:
-                add([(k1[-1], k2[0], k2[1])], n)
+                add((k1[-1], k2[0], k2[1]), n)
     for (m1, m2, m3), c in trigram.items():
-        k2 = keys_of(m2, m3)
+        k2 = seq_of(m2, m3)
         if not k2 or len(k2) != 1:
             continue
-        k1, k3 = keys_of(m1, m2), keys_of(m3, None)
+        k1, k3 = seq_of(m1, m2), seq_of(m3, None)
         if k1 and k3:
-            out[k1[-1], k2[0], k3[0]] += c
+            add((k1[-1], k2[0], k3[0]), c)
+    return out
+
+
+def key_trigrams(
+    ng: Ngrams, trigram: dict[tuple[str, str, str], int], keys_of: KeysOf
+) -> np.ndarray:
+    """(N_KEYS, N_KEYS, N_KEYS) counts of consecutive keystroke triples."""
+    out = np.zeros((N_KEYS, N_KEYS, N_KEYS))
+    for (a, b, c), n in count_runs(ng, trigram, keys_of).items():
+        out[a, b, c] += n
+    return out
+
+
+def unit_trigrams(
+    ng: Ngrams, trigram: dict[tuple[str, str, str], int], spec: Spec
+) -> tuple[np.ndarray, np.ndarray]:
+    """Runs of three consecutive units (indices into spec.units) and their counts.
+
+    Uses the same segmentation as ngram.ngram_unit_stats(), for the optimizer."""
+    pattern = tokenizer(spec)
+    placed = set(spec.units)
+    composites = {k: v for k, v in spec.composites.items() if k not in placed}
+    index = {u: i for i, u in enumerate(spec.units)}
+    cache: dict[str, tuple[int, ...] | None] = {}
+
+    def units_of(mora: str, _next: str | None = None) -> tuple[int, ...] | None:
+        if mora not in cache:
+            out: list[int] = []
+            for t in pattern.findall(mora):
+                units = (t,) if t in placed else composites.get(t)
+                if not units:
+                    cache[mora] = None
+                    break
+                out += [index[u] for u in units]
+            else:
+                cache[mora] = tuple(out)
+        return cache[mora]
+
+    runs = count_runs(ng, trigram, units_of)
+    idx = np.array(list(runs), dtype=int).reshape(-1, 3)
+    return idx, np.array(list(runs.values()), dtype=float)
+
+
+def text_runs(corpus: str, spec: Spec, seq_of_unit) -> dict[tuple[int, int, int], float]:
+    """Runs of three items in a kana corpus; seq_of_unit maps a unit to its items.
+
+    Lines and characters that cannot be typed break the runs."""
+    pattern = tokenizer(spec)
+    placed = set(spec.units)
+    composites = {k: v for k, v in spec.composites.items() if k not in placed}
+    out: dict[tuple[int, int, int], float] = {}
+    for line in corpus.split(SEP):
+        seq: list[int] = []
+        for t in [*pattern.findall(line), None]:
+            units = None if t is None else (t,) if t in placed else composites.get(t)
+            if units:
+                for u in units:
+                    seq += seq_of_unit(u)
+                continue
+            for run in zip(seq, seq[1:], seq[2:], strict=False):
+                out[run] = out.get(run, 0) + 1
+            seq = []
+    return out
+
+
+def text_key_trigrams(corpus: str, layout: Layout, spec: Spec, cost: CostModel) -> np.ndarray:
+    keys = unit_keys(layout, cost)
+    out = np.zeros((N_KEYS,) * 3)
+    for (a, b, c), n in text_runs(corpus, spec, lambda u: keys[u]).items():
+        out[a, b, c] += n
+    return out
+
+
+def text_unit_trigrams(corpus: str, spec: Spec) -> tuple[np.ndarray, np.ndarray]:
+    index = {u: i for i, u in enumerate(spec.units)}
+    runs = text_runs(corpus, spec, lambda u: (index[u],))
+    idx = np.array(list(runs), dtype=int).reshape(-1, 3)
+    return idx, np.array(list(runs.values()), dtype=float)
+
+
+def romaji_text_trigrams(corpus: str) -> np.ndarray:
+    out = np.zeros((N_KEYS,) * 3)
+    for line in corpus.split(SEP):
+        keys, _ = romaji.to_romaji(line)
+        ids = [KEY_INDEX.get(k, -1) for k in keys]
+        for a, b, c in zip(ids, ids[1:], ids[2:], strict=False):
+            if min(a, b, c) >= 0:
+                out[a, b, c] += 1
     return out
 
 
@@ -219,3 +309,31 @@ def trigram_report(tri: np.ndarray, label: str, mask: np.ndarray, top: int = 10)
             break
         items.append(f"{names[a]}{names[b]}{names[c]}:{100 * counts[a, b, c] / total:.2f}")
     return f"{label}: " + " ".join(items)
+
+
+# cost.toml [trigram] key -> class
+TRIGRAM_WEIGHTS = {
+    "redirect": "方向転換",
+    "bad_redirect": "悪い方向転換",
+    "alternate": "交互",
+    "roll_in": "内ロール",
+    "roll_out": "外ロール",
+    "onehand_in": "片手内ロール",
+    "onehand_out": "片手外ロール",
+}
+
+
+def trigram_cost(weights: dict[str, float]) -> np.ndarray | None:
+    """(N_KEYS,)*3 cost of each keystroke triple, or None if every weight is 0."""
+    unknown = set(weights) - set(TRIGRAM_WEIGHTS) - {"skip_same_finger"}
+    if unknown:
+        raise ValueError(f"[trigram] に知らない項目がある: {sorted(unknown)}")
+    if not any(weights.values()):
+        return None
+    out = np.zeros((N_KEYS,) * 3)
+    masks = class_masks()
+    for key, cls in TRIGRAM_WEIGHTS.items():
+        out[masks[cls]] += float(weights.get(key, 0.0))
+    sfs, _ = skip_masks()
+    out[sfs] += float(weights.get("skip_same_finger", 0.0))
+    return out
