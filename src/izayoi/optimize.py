@@ -29,7 +29,8 @@ from .layout import (
 
 # Added to cost/kana for each shift-omission unit whose prefix cannot be omitted,
 # for each postfix rule overridden by a shift omission, and for each preferred
-# postfix rule (omit_preferred) whose prefix cannot be omitted.
+# postfix rule (omit_preferred) whose prefix cannot be omitted, and for each unit
+# sharing a key with another unit of its distinct_keys group.
 OMISSION_PENALTY = 1.0
 NO_RULE = 1 << 30
 
@@ -130,6 +131,8 @@ class Annealer:
         `trigrams` (runs of three units and their counts, trigram.unit_trigrams()) adds
         the three-stroke cost of cost.trigram; both are needed for it."""
         self.cfg = cfg
+        # After annealing, apply the moves that lower the cost until none is left.
+        self.polish = True
         # Shadow units (units typed without their prefix) come last in the stats and
         # are never placed themselves: they follow the slot of their kana. Those of
         # omit_units ("に*") come first, then those of postfix rules ("ふ*ゃ").
@@ -287,6 +290,14 @@ class Annealer:
                 for u in allowed:
                     allowed[u] = {kept[u]} if u in kept else allowed[u] - taken
 
+        # Groups of units that must sit on different keys.
+        self.distinct = []
+        for group in cfg.constraints.distinct_keys:
+            unknown = [u for u in group if u not in ui]
+            if unknown:
+                raise ConstraintError(f"distinct_keys refers to unknown units {unknown}")
+            self.distinct.append(np.array([ui[u] for u in group], dtype=int))
+
         self.allowed = [sorted(allowed[u]) for u in range(len(self.units))]
         self.allowed_mask = np.zeros((len(self.units), n), dtype=bool)
         for u, ss in enumerate(self.allowed):
@@ -329,12 +340,16 @@ class Annealer:
     ) -> int:
         """Omission units on a prefix slot whose base key is empty, missing or another one,
         plus the postfix rules that the shift omissions override, plus the preferred postfix
-        rules whose prefix cannot be omitted."""
+        rules whose prefix cannot be omitted, plus the units of a distinct_keys group that
+        share a key with another unit of the group."""
         if occupant is None:
             occupant = self._occupant(pos)
         if omitted is None:
             omitted = self.pair_omitted(pos, occupant)
         preferred = int((self.pair_preferred & ~omitted).sum())
+        for group in self.distinct:
+            keys = self.key_only[pos[group]]
+            preferred += len(keys) - len(np.unique(keys))
         if not len(self.omit_idx):
             return preferred
         base = self.base_of[pos[self.omit_idx]]
@@ -538,14 +553,46 @@ class Annealer:
                     for s, u in old.items():
                         if u >= 0:
                             pos[u] = s
+            if self.polish:
+                cur = self._polish(pos, occupant, units)
             self.forget()
             cur = self.cost(pos)  # without the rounding errors of the updates
             bad = self.omission_violations(pos)
-            note = f"（シフト省略の違反 {bad} 件）" if bad else ""
+            note = f"（シフト省略・別キーの違反 {bad} 件）" if bad else ""
             log(f"restart {r + 1}/{self.cfg.restarts}: cost/kana = {cur:.4f}{note}")
             if cur < best:
                 best, best_pos = cur, pos.copy()
         return best_pos, best
+
+    def _polish(self, pos: np.ndarray, occupant: np.ndarray, units: list[int]) -> float:
+        """Apply every move that lowers the cost until none is left (a local minimum)."""
+        self.forget()
+        cur = self.cost(pos)
+        self.accept()
+        improved = True
+        while improved:
+            improved = False
+            for ua in units:
+                for b in self.allowed[ua]:
+                    changes = self._try_move(pos, occupant, ua, b)
+                    if not changes:
+                        continue
+                    old = {s: int(occupant[s]) for s in changes}
+                    for s, u in changes.items():
+                        if u >= 0:
+                            pos[u] = s
+                    new = self.cost(pos)
+                    if new < cur - 1e-12:
+                        cur = new
+                        self.accept()
+                        improved = True
+                        for s, u in changes.items():
+                            occupant[s] = u
+                    else:
+                        for s, u in old.items():
+                            if u >= 0:
+                                pos[u] = s
+        return cur
 
     def to_layout(self, pos: np.ndarray, name: str) -> Layout:
         prefix: dict = {"keys": self.cfg.prefix_keys}

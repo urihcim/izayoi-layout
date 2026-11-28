@@ -168,6 +168,7 @@ n-gram 表の扱い:
 | 特定の文字を特定のキーに固定する | `[constraints.pinned]`（例: `"、" = "base @,"`） |
 | 場所を特定の文字専用にする | `[[constraints.exclusive]]` の `area` と `units` |
 | 2 つの文字の位置をそろえる | `[constraints.aligned]`（例: `"が" = "か"`） |
+| 文字どうしを別のキーに置く | `[[constraints.distinct_keys]]` の `units`（どの面でも同じキーに 2 つ置かない。例: い段の清音） |
 | 置ける場所を制限する | `[[constraints.area]]` の `in` / `not_in`（例: 句読点は右手の小指以外 `"right !pinky"`） |
 | キーを空けておく | `constraints.reserved` |
 | 気に入った案を土台に一部だけ動かす | `optimize --init <配列> --free '<動かす文字>'`。制約に違反している文字は自動で動く |

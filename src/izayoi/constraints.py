@@ -103,6 +103,8 @@ class Constraints:
     # follower -> leader: the follower sits on the same key as the leader,
     # in the prefix shift on the same hand as that key (e.g. が follows か)
     aligned: dict[str, str] = field(default_factory=dict)
+    # groups of units that must sit on different keys (in any layer)
+    distinct_keys: list[list[str]] = field(default_factory=list)
 
     @classmethod
     def from_toml(cls, data: dict) -> Constraints:
@@ -112,6 +114,7 @@ class Constraints:
             reserved=list(data.get("reserved", [])),
             exclusive=list(data.get("exclusive", [])),
             aligned=dict(data.get("aligned", {})),
+            distinct_keys=[list(r["units"]) for r in data.get("distinct_keys", [])],
         )
         leaders = list(c.aligned.values())
         if dup := {u for u in leaders if leaders.count(u) > 1}:
@@ -189,6 +192,14 @@ class Constraints:
             if follower in placement and leader in placement:
                 if placement[follower] != aligned_slot(placement[leader], layers):
                     out.append(f"{follower} が {leader} と同じキーの同手シフトにない")
+        for group in self.distinct_keys:
+            by_key: dict[str, list[str]] = {}
+            for u in group:
+                if u in placement:
+                    by_key.setdefault(placement[u][1], []).append(u)
+            for key, us in by_key.items():
+                if len(us) > 1:
+                    out.append(f"{'・'.join(us)} が同じキー（{key}）にある")
         return out
 
 
