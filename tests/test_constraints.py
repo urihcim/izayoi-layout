@@ -146,3 +146,27 @@ def test_annealer_keeps_aligned_units_together():
     assert set(layout.layers["solo"].values()) == {"、", "。"}
     assert layout.sequences()[where["、"][1] + " "] == "、"
     assert cfg.constraints.violations(where, cfg.slots, cfg.layers) == []
+
+
+def test_annealer_keeps_distinct_keys_apart():
+    from pathlib import Path
+
+    root = Path(__file__).parent.parent
+    cfg = load_config(root / "config" / "optimize.toml")
+    cfg.iterations, cfg.restarts = 3000, 1
+    group = ["い", "き", "し", "ち", "に", "ひ", "み", "り"]
+    cfg.constraints.distinct_keys = [group]
+    corpus = "かがくのしんぽはめざましい。きょうはびょういんへいった、ぱんをかう\n"
+    annealer = Annealer(cfg, segment(corpus, cfg.spec), load_cost_model(root / "config/cost.toml"))
+    pos, _ = annealer.run(log=lambda _: None)
+    layout = annealer.to_layout(pos, "t")
+    keys = [k for grid in layout.layers.values() for k, out in grid.items() if out in group]
+    assert len(keys) == len(set(keys)) == len(group)
+
+
+def test_distinct_keys_violations():
+    c = Constraints.from_toml({"distinct_keys": [{"units": ["い", "き"]}]})
+    assert c.violations({"い": ("base", "s"), "き": ("k", "s")}, SLOTS, LAYERS) == [
+        "い・き が同じキー（s）にある"
+    ]
+    assert c.violations({"い": ("base", "s"), "き": ("k", "l")}, SLOTS, LAYERS) == []

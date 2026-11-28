@@ -56,6 +56,7 @@ KEY_INFO = _keys()
 class CostModel:
     effort: np.ndarray  # (N_KEYS,)
     bigram: np.ndarray  # (N_KEYS, N_KEYS)
+    trigram: np.ndarray | None = None  # (N_KEYS,)*3; None if [trigram] has no weight
 
 
 def load_cost_model(path: str | Path) -> CostModel:
@@ -101,7 +102,9 @@ def load_cost_model(path: str | Path) -> CostModel:
                 dx = abs((b.col + offset[b.row]) - (a.col + offset[a.row]))
                 cost += cramp * max(0.0, 1.0 - dx)
             bigram[i, j] = cost
-    return CostModel(effort, bigram)
+    from .trigram import trigram_cost
+
+    return CostModel(effort, bigram, trigram_cost(cfg.get("trigram", {})))
 
 
 def classify_bigrams() -> dict[str, np.ndarray]:

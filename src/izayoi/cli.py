@@ -94,16 +94,24 @@ def _cmd_eval(args) -> None:
 
     source = _load_source(args.corpus)
     cost = load_cost_model(args.cost)
-    rows = []
+    # Keystroke triples: for the three-stroke metrics and the [trigram] cost.
+    need_tri = args.trigram or cost.trigram is not None
+    rows, tris = [], []
     if args.romaji:
-        rows.append(("ローマ字", metrics(_romaji_stats(source), cost)))
+        tri = _romaji_trigrams(source, args.corpus) if need_tri else None
+        rows.append(("ローマ字", metrics(_romaji_stats(source), cost, tri)))
+        tris.append(("ローマ字", tri))
     details = []
     for path in args.layouts:
         layout = load(path)
         us = _unit_stats(source, Spec.from_layout(layout))
-        rows.append((path.stem, metrics(layout_stats(path.stem, layout, us, cost), cost)))
+        tri = _key_trigrams(source, args.corpus, layout, cost) if need_tri else None
+        rows.append((path.stem, metrics(layout_stats(path.stem, layout, us, cost), cost, tri)))
+        tris.append((path.stem, tri))
         details.append((path.stem, us))
     print(format_table(rows))
+    if args.trigram:
+        _print_trigrams(args, tris)
     if args.config:
         from .optimize import load_config
 
@@ -140,6 +148,64 @@ def _cmd_eval(args) -> None:
             )
 
 
+def _trigram_dir(path: Path) -> Path:
+    from .trigram import has_trigram
+
+    if not has_trigram(path):
+        raise ValueError(
+            f"{path} に 3gram.csv がない（corpus-fetch-ngram で取得する）。"
+            "3 打鍵の評価と cost.toml の [trigram] に必要"
+        )
+    return path
+
+
+def _key_trigrams(source, corpus: Path, layout, cost):
+    """Keystroke triples of the layout, from the n-gram tables or the kana corpus."""
+    from .evaluate import Spec
+    from .ngram import Ngrams
+    from .trigram import key_trigrams, layout_keys_of, load_trigram, text_key_trigrams
+
+    spec = Spec.from_layout(layout)
+    if isinstance(source, Ngrams):
+        trigram = _TRIGRAM_CACHE.get(corpus)
+        if trigram is None:
+            trigram = _TRIGRAM_CACHE[corpus] = load_trigram(_trigram_dir(corpus))
+        return key_trigrams(source, trigram, layout_keys_of(layout, spec, cost))
+    return text_key_trigrams(source, layout, spec, cost)
+
+
+_TRIGRAM_CACHE: dict = {}
+
+
+def _romaji_trigrams(source, corpus: Path):
+    from .ngram import Ngrams
+    from .trigram import key_trigrams, load_trigram, romaji_keys_of, romaji_text_trigrams
+
+    if isinstance(source, Ngrams):
+        trigram = _TRIGRAM_CACHE.get(corpus)
+        if trigram is None:
+            trigram = _TRIGRAM_CACHE[corpus] = load_trigram(_trigram_dir(corpus))
+        return key_trigrams(source, trigram, romaji_keys_of)
+    return romaji_text_trigrams(source)
+
+
+def _print_trigrams(args, tris) -> None:
+    from .evaluate import format_table
+    from .trigram import class_masks, skip_masks, trigram_metrics, trigram_report
+
+    rows = [(name, trigram_metrics(tri)) for name, tri in tris]
+    print("\n3 打鍵の連なり\n" + format_table(rows))
+    if args.detail:
+        masks = class_masks()
+        sfs, _ = skip_masks()
+        for name, tri in tris:
+            if name == "ローマ字":
+                continue
+            for c in ("悪い方向転換", "同指を含む"):
+                print(f"[{name}] " + trigram_report(tri, c, masks[c]))
+            print(f"[{name}] " + trigram_report(tri, "1打飛ばし同指", sfs))
+
+
 def _violations(layout, cfg) -> list[str]:
     if layout.prefix_keys != cfg.prefix_keys:
         return [f"前置シフトキーが設定と違う: {layout.prefix_keys}"]
@@ -168,16 +234,30 @@ def _cmd_optimize(args) -> None:
         cfg.restarts = args.restarts
     if args.seed is not None:
         cfg.seed = args.seed
-    us = _unit_stats(_load_source(args.corpus), cfg.spec)
+    from .ngram import Ngrams
+
+    source = _load_source(args.corpus)
+    us = _unit_stats(source, cfg.spec)
     init = load(args.init) if args.init else None
     free = set(args.free) if args.free is not None else None
     if free is not None and init is None:
         raise ValueError("--free は --init と一緒に指定してください")
-    annealer = Annealer(cfg, us, load_cost_model(args.cost), init, free)
+    cost = load_cost_model(args.cost)
+    trigrams = None
+    if cost.trigram is not None:
+        from .trigram import load_trigram, text_unit_trigrams, unit_trigrams
+
+        if isinstance(source, Ngrams):
+            trigrams = unit_trigrams(source, load_trigram(_trigram_dir(args.corpus)), cfg.spec)
+        else:
+            trigrams = text_unit_trigrams(source, cfg.spec)
+    annealer = Annealer(cfg, us, cost, init, free, trigrams)
     pos, best = annealer.run()
     layout = annealer.to_layout(pos, args.output.stem)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     origin = f", init={args.init}" if args.init else ""
+    if isinstance(source, Ngrams):
+        origin += f", n-gram 表 {args.corpus.name}" + (" 3-gram 込み" if trigrams else "")
     header = f"# {args.config} から生成（seed={cfg.seed}{origin}, cost/kana={best:.4f}）\n"
     args.output.write_text(dump(layout, header), encoding="utf-8")
     print(f"wrote {args.output}")
@@ -223,6 +303,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--detail", action="store_true", help="未対応文字と後置シフトの衝突を表示")
     p.add_argument("--config", type=Path, help="この設定の制約を守っているか確認する")
     p.add_argument("--targets", type=Path, help="打鍵数の目標（config/targets.toml）を確認する")
+    p.add_argument(
+        "--trigram",
+        action="store_true",
+        help="3 打鍵の連なりを評価する（n-gram 表では 3gram.csv が必要）",
+    )
     p.add_argument(
         "--corpus",
         type=Path,

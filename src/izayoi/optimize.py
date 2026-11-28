@@ -29,7 +29,8 @@ from .layout import (
 
 # Added to cost/kana for each shift-omission unit whose prefix cannot be omitted,
 # for each postfix rule overridden by a shift omission, and for each preferred
-# postfix rule (omit_preferred) whose prefix cannot be omitted.
+# postfix rule (omit_preferred) whose prefix cannot be omitted, and for each unit
+# sharing a key with another unit of its distinct_keys group.
 OMISSION_PENALTY = 1.0
 NO_RULE = 1 << 30
 
@@ -122,10 +123,16 @@ class Annealer:
         cost: CostModel,
         init: Layout | None = None,
         free: set[str] | None = None,
+        trigrams: tuple[np.ndarray, np.ndarray] | None = None,
     ):
         """With `init`, start from that layout. If `free` is also given, only those
-        units (and units whose initial slot breaks a constraint) are moved."""
+        units (and units whose initial slot breaks a constraint) are moved.
+
+        `trigrams` (runs of three units and their counts, trigram.unit_trigrams()) adds
+        the three-stroke cost of cost.trigram; both are needed for it."""
         self.cfg = cfg
+        # After annealing, apply the moves that lower the cost until none is left.
+        self.polish = True
         # Shadow units (units typed without their prefix) come last in the stats and
         # are never placed themselves: they follow the slot of their kana. Those of
         # omit_units ("に*") come first, then those of postfix rules ("ふ*ゃ").
@@ -166,6 +173,20 @@ class Annealer:
         self.bigram = us.bigram
         self.n_kana = us.n_kana
         self.T = cost.bigram
+        self.T3 = cost.trigram if trigrams is not None else None
+        if self.T3 is not None:
+            idx, counts = trigrams
+            self.tri_a, self.tri_b, self.tri_c = idx[:, 0], idx[:, 1], idx[:, 2]
+            self.tri_n = counts
+            # Runs that involve each unit (for updating the cost after a move).
+            n_units = len(us.units)
+            self.tri_of = [np.empty(0, dtype=int)] * n_units
+            for u in range(n_units):
+                hit = (self.tri_a == u) | (self.tri_b == u) | (self.tri_c == u)
+                self.tri_of[u] = np.nonzero(hit)[0]
+        # Three-stroke cost of the last accepted placement: (first, last, single, cost).
+        self._tri_state: tuple | None = None
+        self._tri_pending: tuple | None = None
 
         self.layers = layers = cfg.layers
         self.slots = cfg.slots
@@ -191,6 +212,8 @@ class Annealer:
                 self.first[i], self.last[i] = p, key
                 self.slot_cost[i] = cost.effort[p] + cost.effort[key] + cost.bigram[p, key]
 
+        # Whether a unit on the slot is typed with a single stroke.
+        self.single = np.array([layer == "base" for layer, _ in self.slots])
         # Key without prefix, used by shadow units.
         self.key_only = np.array([KEY_INDEX[k] for _, k in self.slots], dtype=int)
         self.key_only_cost = cost.effort[self.key_only]
@@ -267,6 +290,14 @@ class Annealer:
                 for u in allowed:
                     allowed[u] = {kept[u]} if u in kept else allowed[u] - taken
 
+        # Groups of units that must sit on different keys.
+        self.distinct = []
+        for group in cfg.constraints.distinct_keys:
+            unknown = [u for u in group if u not in ui]
+            if unknown:
+                raise ConstraintError(f"distinct_keys refers to unknown units {unknown}")
+            self.distinct.append(np.array([ui[u] for u in group], dtype=int))
+
         self.allowed = [sorted(allowed[u]) for u in range(len(self.units))]
         self.allowed_mask = np.zeros((len(self.units), n), dtype=bool)
         for u, ss in enumerate(self.allowed):
@@ -309,12 +340,16 @@ class Annealer:
     ) -> int:
         """Omission units on a prefix slot whose base key is empty, missing or another one,
         plus the postfix rules that the shift omissions override, plus the preferred postfix
-        rules whose prefix cannot be omitted."""
+        rules whose prefix cannot be omitted, plus the units of a distinct_keys group that
+        share a key with another unit of the group."""
         if occupant is None:
             occupant = self._occupant(pos)
         if omitted is None:
             omitted = self.pair_omitted(pos, occupant)
         preferred = int((self.pair_preferred & ~omitted).sum())
+        for group in self.distinct:
+            keys = self.key_only[pos[group]]
+            preferred += len(keys) - len(np.unique(keys))
         if not len(self.omit_idx):
             return preferred
         base = self.base_of[pos[self.omit_idx]]
@@ -349,8 +384,55 @@ class Annealer:
         pair_cost = np.where(omitted, self.key_only_cost[ps], self.slot_cost[ps])
         unit = self.freq @ np.concatenate([self.slot_cost[pos], self.key_only_cost[src], pair_cost])
         boundary = (self.bigram * self.T[last[:, None], first[None, :]]).sum()
+        if self.T3 is not None:
+            single = np.concatenate(
+                [self.single[pos], np.ones(len(src), dtype=bool), omitted | self.single[ps]]
+            )
+            boundary += self._trigram_cost(first, last, single)
         violations = self.omission_violations(pos, occupant, omitted)
         return float(unit + boundary) / self.n_kana + OMISSION_PENALTY * violations
+
+    def _trigram_cost(self, first: np.ndarray, last: np.ndarray, single: np.ndarray) -> float:
+        """Cost of runs of three strokes, from the first and last stroke of each unit.
+
+        Runs of three units are updated from the last accepted placement (accept())
+        when there is one: only the runs with a unit whose strokes changed are recomputed.
+        """
+        T3 = self.T3
+        two = ~single
+        # A two-stroke unit followed by a unit, and a unit followed by a two-stroke unit.
+        a = (T3[first[:, None], last[:, None], first[None, :]] * two[:, None]).astype(float)
+        a += T3[last[:, None], first[None, :], last[None, :]] * two[None, :]
+        cost = (self.bigram * a).sum()
+        # Three units, the middle one a single stroke.
+        state = self._tri_state
+        if state is None:
+            runs = self._runs_cost(slice(None), first, last, single)
+        else:
+            f0, l0, s0, runs = state
+            changed = np.nonzero((f0 != first) | (l0 != last) | (s0 != single))[0]
+            if len(changed):
+                mask = np.zeros(len(self.tri_n), dtype=bool)
+                for u in changed:
+                    mask[self.tri_of[u]] = True
+                idx = np.flatnonzero(mask)
+                runs += self._runs_cost(idx, first, last, single)
+                runs -= self._runs_cost(idx, f0, l0, s0)
+        self._tri_pending = (first, last, single, runs)
+        return cost + runs
+
+    def _runs_cost(self, idx, first, last, single) -> float:
+        b = self.tri_b[idx]
+        w = self.T3[last[self.tri_a[idx]], last[b], first[self.tri_c[idx]]] * single[b]
+        return float(self.tri_n[idx] @ w)
+
+    def accept(self) -> None:
+        """Make the placement of the last cost() call the base for the next ones."""
+        self._tri_state = self._tri_pending
+
+    def forget(self) -> None:
+        """Compute the next cost() from scratch."""
+        self._tri_state = None
 
     def _initial(self, rng: random.Random, attempts: int = 200) -> np.ndarray:
         n_units, n_slots = len(self.units), len(self.slots)
@@ -447,7 +529,9 @@ class Annealer:
             pos = self._initial(rng)
             occupant = np.full(len(self.slots), -1)
             occupant[pos] = np.arange(len(pos))
+            self.forget()
             cur = self.cost(pos)
+            self.accept()
             n = self.cfg.iterations if units else 0
             for it in range(n):
                 temp = t0 * (t1 / t0) ** (it / n)
@@ -462,18 +546,53 @@ class Annealer:
                 new = self.cost(pos)
                 if new <= cur or rng.random() < math.exp((cur - new) / temp):
                     cur = new
+                    self.accept()
                     for s, u in changes.items():
                         occupant[s] = u
                 else:
                     for s, u in old.items():
                         if u >= 0:
                             pos[u] = s
+            if self.polish:
+                cur = self._polish(pos, occupant, units)
+            self.forget()
+            cur = self.cost(pos)  # without the rounding errors of the updates
             bad = self.omission_violations(pos)
-            note = f"（シフト省略の違反 {bad} 件）" if bad else ""
+            note = f"（シフト省略・別キーの違反 {bad} 件）" if bad else ""
             log(f"restart {r + 1}/{self.cfg.restarts}: cost/kana = {cur:.4f}{note}")
             if cur < best:
                 best, best_pos = cur, pos.copy()
         return best_pos, best
+
+    def _polish(self, pos: np.ndarray, occupant: np.ndarray, units: list[int]) -> float:
+        """Apply every move that lowers the cost until none is left (a local minimum)."""
+        self.forget()
+        cur = self.cost(pos)
+        self.accept()
+        improved = True
+        while improved:
+            improved = False
+            for ua in units:
+                for b in self.allowed[ua]:
+                    changes = self._try_move(pos, occupant, ua, b)
+                    if not changes:
+                        continue
+                    old = {s: int(occupant[s]) for s in changes}
+                    for s, u in changes.items():
+                        if u >= 0:
+                            pos[u] = s
+                    new = self.cost(pos)
+                    if new < cur - 1e-12:
+                        cur = new
+                        self.accept()
+                        improved = True
+                        for s, u in changes.items():
+                            occupant[s] = u
+                    else:
+                        for s, u in old.items():
+                            if u >= 0:
+                                pos[u] = s
+        return cur
 
     def to_layout(self, pos: np.ndarray, name: str) -> Layout:
         prefix: dict = {"keys": self.cfg.prefix_keys}

@@ -7,7 +7,8 @@ https://sizu.me/ditto/posts/2n3nhwene9ae
 Each row is a sequence of morae (the アクション column, e.g. "しゃ|し|ん"; the
 common 拗音 and 外来音 count as one mora) and its count. Only the 1-gram and 2-gram tables are used:
 every metric depends on single strokes and consecutive stroke pairs, and a
-pair never reaches further back than the previous mora.
+pair never reaches further back than the previous mora. The 3-gram table is
+used only for the three-stroke metrics (trigram.py).
 """
 
 from __future__ import annotations
@@ -29,6 +30,8 @@ LOGOS_URLS = {
     "1gram.csv": "https://files.catbox.moe/t5vksz.csv",
     "2gram.csv": "https://files.catbox.moe/ilcidg.csv",
 }
+# Optional (about 10 MB): only the three-stroke metrics use it.
+LOGOS_OPTIONAL_URLS = {"3gram.csv": "https://files.catbox.moe/i5mba5.csv"}
 
 
 @dataclass
@@ -57,7 +60,7 @@ def _fetch(url: str, tries: int = 4) -> bytes:
 def fetch_logos(dest: Path) -> list[Path]:
     dest.mkdir(parents=True, exist_ok=True)
     paths = []
-    for name, url in LOGOS_URLS.items():
+    for name, url in (LOGOS_URLS | LOGOS_OPTIONAL_URLS).items():
         (dest / name).write_bytes(_fetch(url))
         paths.append(dest / name)
     return paths
